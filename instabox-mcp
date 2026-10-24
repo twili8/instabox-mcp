@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+import json, os, sys, time, uuid, urllib.request, urllib.error, base64
+
+ENV = os.path.expanduser("~/.config/instabox/env")
+
+
+def load_env():
+    if os.path.exists(ENV):
+        with open(ENV) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def cfg():
+    load_env()
+    key = os.environ.get("INSTABOX_API_KEY")
+    url = os.environ.get("INSTABOX_API_URL", "https://api.instabox.sh").rstrip("/")
+    if not key:
+        raise RuntimeError("INSTABOX_API_KEY not set")
+    return key, url
+
+
+def api(method, path, body=None, timeout=120, headers=None, query=None):
+    key, url = cfg()
+    if query:
+        path = path + "?" + "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in query.items())
+    h = {"X-API-Key": key, "Accept": "application/json"}
+    if headers:
+        h.update(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h.setdefault("Content-Type", "application/json")
+    r = urllib.request.Request(url + path, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = raw.decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {json.dumps(obj)}")
+
+
+def poll(op_id, timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, op = api("GET", f"/v1/operations/{op_id}", timeout=30)
+        if op.get("state") in ("succeeded", "failed"):
+            return op
+        time.sleep(2)
+    raise RuntimeError(f"timed out waiting for {op_id}")
+
+
+TOOLS = [
+    {"name": "instabox_init", "description": "Save API key/URL to ~/.config/instabox/env (mode 600).", "inputSchema": {"type": "object", "properties": {"apiKey": {"type": "string"}, "apiUrl": {"type": "string", "default": "https://api.instabox.sh"}}, "required": ["apiKey"], "additionalProperties": False}},
+    {"name": "instabox_usage", "description": "Return machine/snapshot counts, stored bytes, and limits.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "instabox_templates", "description": "List available templates (id and latest version).", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "instabox_list_machines", "description": "List machines (name, id, state, ready).", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "instabox_get_machine", "description": "Get a machine by name or id.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_create_machine", "description": "Create a machine from a template and wait until ready.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "template": {"type": "string", "default": "universal"}, "desiredState": {"type": "string", "enum": ["running", "stopped"]}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["name"], "additionalProperties": False}},
+    {"name": "instabox_delete_machine", "description": "Delete a machine by name or id and wait for completion.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_exec", "description": "Run a shell command in a machine and return stdout/stderr/exit code.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "command": {"type": "string"}, "cwd": {"type": "string"}, "envs": {"type": "object"}, "stdin": {"type": "string"}, "timeoutSeconds": {"type": "integer", "default": 120}}, "required": ["machine", "command"], "additionalProperties": False}},
+    {"name": "instabox_read_file", "description": "Read a file or list a directory in a machine.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "path": {"type": "string", "default": "/"}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_write_file", "description": "Write text content to a file in a machine via exec.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean", "default": False}}, "required": ["machine", "path", "content"], "additionalProperties": False}},
+    {"name": "instabox_start_machine", "description": "Start/resume a stopped or paused machine and wait.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_stop_machine", "description": "Stop a running machine (files kept) and wait.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "timeoutSeconds": {"type": "integer", "default": 60}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_suspend_machine", "description": "Pause a running machine (memory kept) and wait.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_resume_machine", "description": "Resume a paused machine and wait.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_update_machine", "description": "Update auto-suspend and/or metadata labels.", "inputSchema": {"type": "object", "properties": {"machine": {"type": "string"}, "autoSuspendAfterSeconds": {"type": "integer"}, "metadata": {"type": "object"}}, "required": ["machine"], "additionalProperties": False}},
+    {"name": "instabox_wait_operation", "description": "Poll an operation until succeeded/failed.", "inputSchema": {"type": "object", "properties": {"operationId": {"type": "string"}, "waitSeconds": {"type": "integer", "default": 300}}, "required": ["operationId"], "additionalProperties": False}},
+]
+
+
+def resolve_machine(machine):
+    if machine.startswith("m_"):
+        return machine
+    _, m = api("GET", f"/v1/machines/{machine}")
+    return m["id"]
+
+
+def text_result(obj):
+    t = obj if isinstance(obj, str) else json.dumps(obj, indent=2)
+    return {"content": [{"type": "text", "text": t}]}
+    t = obj if isinstance(obj, str) else json.dumps(obj, indent=2)
+    return {"content": [{"type": "text", "text": t}]}
+
+
+def handle_tool(name, args):
+    args = args or {}
+    if name == "instabox_init":
+        os.makedirs(os.path.dirname(ENV), exist_ok=True)
+        with open(ENV, "w") as f:
+            f.write(f"INSTABOX_API_KEY={args['apiKey']}\nINSTABOX_API_URL={args.get('apiUrl', 'https://api.instabox.sh')}\n")
+        os.chmod(ENV, 0o600)
+        return {"saved": ENV}
+        _, o = api("GET", "/v1/me")
+        return o
+    if name == "instabox_usage":
+        _, o = api("GET", "/v1/usage")
+        return o
+    if name == "instabox_templates":
+        _, o = api("GET", "/v1/templates")
+        seen = {}
+        for t in o.get("templates", []):
+            seen[t["id"]] = t.get("version")
+        return [{"id": k, "version": v} for k, v in sorted(seen.items())]
+    if name == "instabox_list_machines":
+        _, o = api("GET", "/v1/machines")
+        return [{"name": m["name"], "id": m["id"], "state": m["state"], "ready": m.get("runtime", {}).get("ready")} for m in o.get("machines", [])]
+    if name == "instabox_get_machine":
+        _, o = api("GET", f"/v1/machines/{args['machine']}")
+        return o
+    if name == "instabox_create_machine":
+        body = {"name": args["name"], "templateId": args.get("template", "universal")}
+        if args.get("desiredState"):
+            body["desiredState"] = args["desiredState"]
+        _, op = api("POST", "/v1/machines", body, headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"create failed: {op.get('error')}")
+        _, m = api("GET", f"/v1/machines/{op['machineId']}")
+        return {"operation": op, "machine": m}
+    if name == "instabox_delete_machine":
+        _, op = api("DELETE", f"/v1/machines/{args['machine']}", headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"delete failed: {op.get('error')}")
+        return op
+    if name == "instabox_exec":
+        body = {"cmd": args["command"], "timeoutSeconds": args.get("timeoutSeconds", 120)}
+        if args.get("cwd"):
+            body["cwd"] = args["cwd"]
+        if args.get("envs"):
+            body["envs"] = args["envs"]
+        if args.get("stdin") is not None:
+            body["stdin"] = args["stdin"]
+        _, o = api("POST", f"/v1/machines/{resolve_machine(args['machine'])}/exec", body, timeout=max(120, args.get("timeoutSeconds", 120) + 30))
+        return o
+    if name == "instabox_read_file":
+        mid = resolve_machine(args["machine"])
+        _, o = api("GET", f"/v1/machines/{mid}/files", query={"path": args.get("path", "/")})
+        return o
+    if name == "instabox_write_file":
+        path = args["path"]
+        content = args["content"]
+        append = args.get("append", False)
+        op = ">>" if append else ">"
+        # use base64 to avoid shell quoting issues
+        b64 = base64.b64encode(content.encode()).decode()
+        cmd = f"mkdir -p \"$(dirname '{path}')\" && printf %s '{b64}' | base64 -d {op} '{path}'"
+        body = {"cmd": cmd, "timeoutSeconds": 120}
+        _, o = api("POST", f"/v1/machines/{resolve_machine(args['machine'])}/exec", body, timeout=180)
+        return o
+    if name == "instabox_start_machine":
+        mid = resolve_machine(args["machine"])
+        _, op = api("POST", f"/v1/machines/{mid}/start", headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"start failed: {op.get('error')}")
+        return op
+    if name == "instabox_stop_machine":
+        mid = resolve_machine(args["machine"])
+        body = {}
+        if args.get("timeoutSeconds") is not None:
+            body["timeoutSeconds"] = args["timeoutSeconds"]
+        _, op = api("POST", f"/v1/machines/{mid}/stop", body=body if body else None, headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"stop failed: {op.get('error')}")
+        return op
+    if name == "instabox_suspend_machine":
+        mid = resolve_machine(args["machine"])
+        _, op = api("POST", f"/v1/machines/{mid}/suspend", headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"suspend failed: {op.get('error')}")
+        return op
+    if name == "instabox_resume_machine":
+        mid = resolve_machine(args["machine"])
+        _, op = api("POST", f"/v1/machines/{mid}/resume", headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"resume failed: {op.get('error')}")
+        return op
+    if name == "instabox_update_machine":
+        mid = resolve_machine(args["machine"])
+        body = {}
+        if args.get("autoSuspendAfterSeconds") is not None:
+            body["autoSuspendAfterSeconds"] = args["autoSuspendAfterSeconds"]
+        if args.get("metadata") is not None:
+            body["metadata"] = args["metadata"]
+        _, m = api("PATCH", f"/v1/machines/{mid}", body=body, headers={"Idempotency-Key": str(uuid.uuid4())})
+        return m
+        name = args["name"]
+        try:
+            _, m = api("GET", f"/v1/machines/{name}")
+            return {"existed": True, "machine": m}
+        except RuntimeError as e:
+            if "HTTP 404" not in str(e):
+                raise
+        body = {"name": name, "templateId": args.get("template", "universal")}
+        _, op = api("POST", "/v1/machines", body, headers={"Idempotency-Key": str(uuid.uuid4())})
+        op = poll(op["id"], timeout=args.get("waitSeconds", 300))
+        if op.get("state") != "succeeded":
+            raise RuntimeError(f"create failed: {op.get('error')}")
+        _, m = api("GET", f"/v1/machines/{op['machineId']}")
+        return {"existed": False, "operation": op, "machine": m}
+    if name == "instabox_wait_operation":
+        op = poll(args["operationId"], timeout=args.get("waitSeconds", 300))
+        return op
+    raise RuntimeError(f"unknown tool: {name}")
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        rid = req.get("id")
+        method = req.get("method")
+        params = req.get("params") or {}
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "instabox", "version": "0.2.0"}}})
+        elif method == "notifications/initialized":
+            pass
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments") or {}
+            try:
+                result = handle_tool(tool_name, arguments)
+                send({"jsonrpc": "2.0", "id": rid, "result": text_result(result)})
+            except Exception as e:
+                send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}})
+        else:
+            if rid is not None:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
+
+
+if __name__ == "__main__":
+    main()
